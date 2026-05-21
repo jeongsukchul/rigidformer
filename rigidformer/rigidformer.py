@@ -60,7 +60,8 @@ class Attention(Module):
         self,
         dim,
         dim_head = 64,
-        heads = 8
+        heads = 8,
+        qk_rmsnorm = True
     ):
         super().__init__()
         dim_inner = dim_head * heads
@@ -73,6 +74,13 @@ class Attention(Module):
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+        # qk rmsnorm
+
+        self.has_qk_rmsnorm = qk_rmsnorm
+
+        self.qk_rmsnorm = nn.RMSNorm(dim_head, elementwise_affine = False)
+        self.qk_rmsnorm_scales = nn.Parameter(torch.ones(2, heads, dim_head))
 
     def forward(
         self,
@@ -89,9 +97,11 @@ class Attention(Module):
 
         queries, keys, values = (self.split_heads(t) for t in (queries, keys, values))
 
-        queries = queries * self.scale
+        if self.has_qk_rmsnorm:
+            queries, keys = tuple(self.qk_rmsnorm(t) for t in (queries, keys))
+            queries, keys = tuple(einx.multiply('b h n d, h d', t, scale) for t, scale in zip((queries, keys), self.qk_rmsnorm_scales))
 
-        sim = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
+        sim = einsum(queries, keys, 'b h i d, b h j d -> b h i j') * self.scale
 
         attn = sim.softmax(dim = -1)
 
