@@ -4,7 +4,7 @@ import pytest
 param = pytest.mark.parametrize
 
 def test_rigidformer():
-    from rigidformer.rigidformer import Rigidformer
+    from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper
 
     object_pos = torch.randn(2, 2, 256, 3)
     object_pos_prev = torch.randn(2, 2, 256, 3)
@@ -30,15 +30,21 @@ def test_rigidformer():
         object_pos_next = object_pos_next,
         anchor_indices = anchor_indices
     )
+
     loss.backward()
 
-    pred = rigidformer(
+    rollout_wrapper = RigidformerRolloutWrapper(rigidformer)
+
+    object_positions = rollout_wrapper(
+        num_steps = 4,
         delta_times = delta_times,
         vertex_properties = vertex_properties,
-        object_pos = object_pos,
-        object_pos_prev = object_pos_prev,
+        object_positions = [object_pos_prev, object_pos],
         anchor_indices = anchor_indices
     )
 
-    assert pred.anchor_next_positions.shape == (2, 2, 4, 3)
-    assert pred.object_next_positions.shape == (2, 2, 256, 3)
+    assert len(object_positions) == 6
+
+    last_position = object_positions[-1]
+
+    assert last_position.shape == (2, 2, 256, 3)

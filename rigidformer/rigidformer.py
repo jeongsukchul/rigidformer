@@ -4,7 +4,7 @@ from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn, cat, stack, tensor, Tensor
+from torch import nn, cat, stack, tensor, is_tensor, Tensor
 from torch.nn import Module, ModuleList, Linear, Parameter
 
 import einx
@@ -19,7 +19,7 @@ import roma
 
 # constants
 
-Predictions = namedtuple('Predictions', ('acceleration', 'anchor_next_positions', 'object_next_positions'))
+Predictions = namedtuple('Predictions', ('acceleration', 'positions'))
 
 Losses = namedtuple('Losses', ('acceleration', 'position'))
 
@@ -30,6 +30,12 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def first(arr):
+    return arr[0]
+
+def last(arr):
+    return arr[-1]
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -405,13 +411,13 @@ class Rigidformer(Module):
     def forward(
         self,
         *,
-        delta_times,             # (b)
-        vertex_properties,       # (b no n d_attr) or (b no d_attr)
-        object_pos,              # (b no n 3)
-        object_pos_prev = None,  # (b no n 3)
-        object_pos_next = None,  # (b no n 3)
-        object_first_frame_pos = None, # (b no n 3)
-        anchor_indices = None,   # (b no na)
+        delta_times,                    # (b)
+        vertex_properties,              # (b no n d_attr) or (b no d_attr)
+        object_pos,                     # (b no n 3)
+        object_pos_prev = None,         # (b no n 3)
+        object_pos_next = None,         # (b no n 3)
+        object_first_frame_pos = None,  # (b no n 3)
+        anchor_indices = None,          # (b no na)
     ):
         batch, max_num_objects = object_pos.shape[:2]
 
@@ -534,10 +540,9 @@ class Rigidformer(Module):
 
             R, T = roma.rigid_points_registration(anchor_pos, pred_anchor_pos_next)
 
-            rigid_anchor_pos_next = einx.add('b no c, b no na c', T, einsum(anchor_pos, R, 'b no na c1, b no c2 c1 -> b no na c2'))
             rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos, R, 'b no n c1, b no c2 c1 -> b no n c2'))
 
-            pred = Predictions(pred_acc, rigid_anchor_pos_next, rigid_object_pos_next)
+            pred = Predictions(pred_acc, rigid_object_pos_next)
 
         if not return_loss:
             return pred
@@ -576,3 +581,50 @@ class Rigidformer(Module):
         )
 
         return total_loss, Losses(acc_loss, pos_loss)
+
+# rollout wrapper, for inference but also for training
+
+class RigidformerRolloutWrapper(Module):
+    def __init__(
+        self,
+        rigidformer: Rigidformer
+    ):
+        super().__init__()
+
+        self.rigidformer = rigidformer
+
+    def forward(
+        self,
+        num_steps,
+        delta_times: Tensor, # (b)
+        *,
+        vertex_properties,              # (b no n d_attr) or (b no d_attr)
+        object_positions: list[Tensor], # must be at least 2
+        anchor_indices = None,          # (b no na)
+    ):
+
+        assert len(object_positions) >= 2, 'object position history must be at least 2'
+        object_positions = object_positions.copy()
+
+        # for the reference vector feature
+
+        object_first_frame_pos = first(object_positions)
+
+        # iterate through steps at delta steps - todo: make delta_times customizable
+
+        for _ in range(num_steps):
+
+            *_, object_pos_prev, object_pos = object_positions
+
+            one_step_pred = self.rigidformer(
+                object_pos = object_pos,
+                delta_times = delta_times,
+                object_pos_prev = object_pos_prev,
+                object_first_frame_pos = object_first_frame_pos,
+                vertex_properties = vertex_properties,
+                anchor_indices = anchor_indices
+            )
+
+            object_positions.append(one_step_pred.positions)
+
+        return object_positions
