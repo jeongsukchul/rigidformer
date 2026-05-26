@@ -11,7 +11,7 @@ import einx
 from einops import einsum, rearrange, repeat, pack, reduce
 from einops.layers.torch import Rearrange, Reduce
 
-from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim
+from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim, lens_to_mask, masked_mean
 
 from x_mlps_pytorch import MLP
 
@@ -50,16 +50,25 @@ def l1norm(t):
 @torch.no_grad()
 def naive_farthest_point_sample(
     positions,  # (... n d)
-    num_points
+    num_points,
+    mask = None # (... n)
 ):
     positions, inverse_pack = pack_with_inverse(positions, '* n p')
     device, batch, max_num_points, d = positions.device, *positions.shape
+
+    if exists(mask):
+        mask, _ = pack_with_inverse(mask, '* n')
 
     sampled = torch.empty((batch, num_points), device = device, dtype = torch.long)
 
     # first one is random
 
-    sampled[:, 0] = torch.randint(0, max_num_points, (batch,), device = device)
+    if exists(mask):
+        first_rand_point = rearrange(mask.float().multinomial(1), '... 1 -> ...')
+    else:
+        first_rand_point = torch.randint(0, max_num_points, (batch,), device = device)
+
+    sampled[:, 0] = first_rand_point
 
     # iterate through remaining, picking the farthest point from the remaining
 
@@ -77,8 +86,10 @@ def naive_farthest_point_sample(
         else:
             min_distances = torch.minimum(min_distances, next_distance)
 
-        next_sampled = min_distances.argmax(dim = -1)
-        sampled[:, next_i] = next_sampled
+        if exists(mask):
+            min_distances.masked_fill_(~mask, -1.)
+
+        sampled[:, next_i] = min_distances.argmax(dim = -1)
 
     return inverse_pack(sampled, '* na')
 
@@ -106,6 +117,7 @@ class PointNetSetAbstract(Module):
         self,
         features, # (... n d)
         pos,      # (... n 3)
+        mask = None
     ):
         pos, inverse_pack_pos = pack_with_inverse(pos, '* n p')
         features, inverse_pack_features = pack_with_inverse(features, '* n d')
@@ -116,7 +128,8 @@ class PointNetSetAbstract(Module):
         # global pool
 
         if not exists(self.num_points) or self.num_points >= n:
-            new_pos = reduce(pos, 'b n p -> b 1 p', 'mean')
+            packed_mask, _ = pack_with_inverse(mask, '* n') if exists(mask) else (None, None)
+            new_pos = masked_mean(pos, packed_mask, dim = -2, keepdim = True)
 
             grouped_pos = einx.subtract('b n p, b 1 p -> b 1 n p', pos, new_pos)
             grouped_features = repeat(features, 'b n d -> b 1 n d')
@@ -124,13 +137,18 @@ class PointNetSetAbstract(Module):
             grouped_features = cat((grouped_pos, grouped_features), dim = -1)
 
             new_features = self.mlp(grouped_features)
+
+            if exists(mask):
+                mask_value = -torch.finfo(new_features.dtype).max
+                new_features = einx.where('b n, b 1 n d, -> b 1 n d', packed_mask, new_features, mask_value)
+
             new_features = reduce(new_features, 'b 1 n d -> b 1 d', 'max')
 
             return inverse_pack_features(new_features, '* n d'), inverse_pack_pos(new_pos, '* n p')
 
         # fps
 
-        sampled_indices = naive_farthest_point_sample(pos, self.num_points)
+        sampled_indices = naive_farthest_point_sample(pos, self.num_points, mask = mask)
 
         new_pos = pos.gather(1, repeat(sampled_indices, 'b n -> b n p', p = 3))
 
@@ -188,10 +206,12 @@ class PointNet(Module):
     def forward(
         self,
         features,  # (... n d)
-        pos        # (... n 3)
+        pos,       # (... n 3)
+        mask = None
     ):
         for layer in self.layers:
-            features, pos = layer(features, pos)
+            features, pos = layer(features, pos, mask = mask)
+            mask = None
 
         features = rearrange(features, '... 1 d -> ... d')
         return features
@@ -254,7 +274,8 @@ class AnchorVertexPool(Module):
         self,
         object_tokens,  # (b no n d)
         object_pos,     # (b no n p)
-        anchor_indices  # (b no na)
+        anchor_indices, # (b no na)
+        mask = None     # (b no n)
     ):
 
         anchor_indices = repeat(anchor_indices, '... -> ... p', p = 3)
@@ -266,6 +287,11 @@ class AnchorVertexPool(Module):
         distance = torch.cdist(packed_anchor_pos, object_pos)
 
         weights = (-distance / self.sigma).exp()
+
+        if exists(mask):
+            packed_mask, _ = pack_with_inverse(mask, '* n')
+            weights = einx.where('b n, b na n, -> b na n', packed_mask, weights, 0.)
+
         weights = l1norm(weights)
 
         weights = inverse_pack(weights)
@@ -396,7 +422,8 @@ class Attention(Module):
         tokens,
         context = None,
         rotary_pos_emb = None,
-        context_rotary_pos_emb = None
+        context_rotary_pos_emb = None,
+        mask = None
     ):
 
         context = default(context, tokens)
@@ -419,6 +446,10 @@ class Attention(Module):
             keys = apply_rotary_pos_emb(context_rotary_pos_emb, keys)
 
         sim = einsum(queries, keys, 'b h i d, b h j d -> b h i j') * self.scale
+
+        if exists(mask):
+            mask_value = -torch.finfo(sim.dtype).max
+            sim = einx.where('b j, b h i j, -> b h i j', mask, sim, mask_value)
 
         attn = sim.softmax(dim = -1)
 
@@ -490,10 +521,7 @@ class Rigidformer(Module):
         self.vertex_encoder = MLP(3 + 3 + vertex_properties_dim, dim * 2, dim)
 
         if not exists(hierarchical_encoder):
-            hierarchical_encoder = nn.Sequential(
-                Reduce('b no n d -> b no d', 'mean'),
-                MLP(dim, dim * 2, dim)
-            )
+            hierarchical_encoder = PointNet(dim = dim, dim_out = dim)
 
         self.hierarchical_encoder = hierarchical_encoder
 
@@ -583,7 +611,7 @@ class Rigidformer(Module):
 
         # loss related
 
-        self.loss_fn = nn.SmoothL1Loss()
+        self.loss_fn = nn.SmoothL1Loss(reduction = 'none')
 
         self.pos_loss_weight = pos_loss_weight
         self.acc_loss_weight = acc_loss_weight
@@ -600,13 +628,18 @@ class Rigidformer(Module):
         object_pos_next = None,         # (b no n 3)
         object_first_frame_pos = None,  # (b no n 3)
         anchor_indices = None,          # (b no na)
+        object_point_lens = None,       # (b no)
+        object_lens = None,             # (b)
     ):
         batch, max_num_objects = object_pos.shape[:2]
+
+        object_mask = lens_to_mask(object_lens, max_len = max_num_objects) if exists(object_lens) else None
+        object_point_mask = lens_to_mask(object_point_lens, max_len = object_pos.shape[-2]) if exists(object_point_lens) else None
 
         # maybe fps
 
         if not exists(anchor_indices):
-            anchor_indices = naive_farthest_point_sample(object_pos, self.num_anchors)
+            anchor_indices = naive_farthest_point_sample(object_pos, self.num_anchors, mask = object_point_mask)
 
         # validate inputs
 
@@ -636,11 +669,12 @@ class Rigidformer(Module):
 
         # hierarchical encoder - pointnet++ or custom
 
-        object_tokens = self.hierarchical_encoder(vertex_tokens, object_pos)
+        encoder_kwargs = dict(mask = object_point_mask) if exists(object_point_mask) else dict()
+        object_tokens = self.hierarchical_encoder(vertex_tokens, object_pos, **encoder_kwargs)
 
         # pool anchors
 
-        pooled_vertex_tokens, anchor_pos = self.anchor_vertex_pool(vertex_tokens, object_pos, anchor_indices)
+        pooled_vertex_tokens, anchor_pos = self.anchor_vertex_pool(vertex_tokens, object_pos, anchor_indices, mask = object_point_mask)
 
         anchor_tokens = self.pooled_object_to_anchor(pooled_vertex_tokens)
 
@@ -671,11 +705,13 @@ class Rigidformer(Module):
 
         object_hiddens = [object_tokens]
 
+        object_mask_with_registers = pad_left_at_dim(object_mask, self.num_register_tokens, value = True) if exists(object_mask) else None
+
         for attn_film, attn, ff_film, ff, attn_residual in self.self_attn_layers:
 
             filmed = attn_film(object_tokens, time_cond)
 
-            object_tokens = attn(filmed, rotary_pos_emb = object_rotary_pos_emb_with_registers) + object_tokens
+            object_tokens = attn(filmed, rotary_pos_emb = object_rotary_pos_emb_with_registers, mask = object_mask_with_registers) + object_tokens
 
             filmed = ff_film(object_tokens, time_cond)
             object_tokens = ff(object_tokens) + object_tokens
@@ -701,7 +737,7 @@ class Rigidformer(Module):
             _, object_context = inverse_pack_registers(object_context) # remove register tokens
 
             filmed = attn_film(anchor_tokens, time_cond)
-            anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context) + anchor_tokens
+            anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context, mask = object_mask) + anchor_tokens
 
             filmed = ff_film(anchor_tokens, time_cond)
             anchor_tokens = ff(filmed) + anchor_tokens
@@ -768,6 +804,13 @@ class Rigidformer(Module):
         acc_loss = loss_fn(pred_acc, anchor_acc) + loss_fn(pred_acc_rigid, anchor_acc)
         pos_loss = loss_fn(pred_anchor_pos_next, anchor_pos_next) + loss_fn(pred_pos_next_rigid, anchor_pos_next)
 
+        if exists(object_mask):
+            acc_loss = masked_mean(acc_loss, object_mask)
+            pos_loss = masked_mean(pos_loss, object_mask)
+        else:
+            acc_loss = acc_loss.mean()
+            pos_loss = pos_loss.mean()
+
         total_loss = (
             acc_loss * self.acc_loss_weight +
             pos_loss * self.pos_loss_weight
@@ -809,6 +852,8 @@ class RigidformerRolloutWrapper(Module):
         object_positions: list[Tensor], # must be at least 2
         num_steps = None,
         anchor_indices = None,          # (b no na)
+        object_point_lens = None,       # (b no)
+        object_lens = None,             # (b)
     ):
 
         # either fixed delta times for num steps
@@ -843,7 +888,9 @@ class RigidformerRolloutWrapper(Module):
                 object_pos_prev = object_pos_prev,
                 object_first_frame_pos = object_first_frame_pos,
                 vertex_properties = vertex_properties,
-                anchor_indices = anchor_indices
+                anchor_indices = anchor_indices,
+                object_point_lens = object_point_lens,
+                object_lens = object_lens
             )
 
             object_positions.append(one_step_pred.positions)

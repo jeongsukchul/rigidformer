@@ -6,10 +6,14 @@ param = pytest.mark.parametrize
 @param('fps', (False, True))
 @param('test_rand_steps', (False, True))
 @param('attn_residual_learned_pooling', (False, True))
+@param('variable_object_lens', (False, True))
+@param('variable_point_lens', (False, True))
 def test_rigidformer(
     fps,
     test_rand_steps,
-    attn_residual_learned_pooling
+    attn_residual_learned_pooling,
+    variable_object_lens,
+    variable_point_lens
 ):
     from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper, PointNet
 
@@ -31,6 +35,12 @@ def test_rigidformer(
     kwargs = dict()
     if not fps:
         kwargs.update(anchor_indices = anchor_indices)
+
+    if variable_object_lens:
+        kwargs.update(object_lens = torch.tensor([1, 2]))
+
+    if variable_point_lens:
+        kwargs.update(object_point_lens = torch.randint(128, 257, (2, 2)))
 
     loss, loss_breakdown = rigidformer(
         delta_times = delta_times,
