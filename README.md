@@ -4,6 +4,66 @@
 
 Implementation of [RigidFormer](https://arxiv.org/abs/2605.09196), Learning Rigid Dynamics using Transformers, out of MIT and Meta
 
+## Install
+
+```bash
+$ pip install rigidformer
+```
+
+## Usage
+
+```python
+import torch
+from rigidformer import Rigidformer, RigidformerRolloutWrapper
+
+# instantiate model
+
+model = Rigidformer(
+    dim = 256,
+    dim_head = 192,
+    heads = 8,
+    object_self_attn_depth = 4,
+    anchor_cross_attn_depth = 4,
+    num_anchors = 4,
+    object_hidden_layers = (0, 1, 2, 4),
+    vertex_properties_dim = 3
+)
+
+# mock inputs
+
+delta_times = torch.randn(2)
+vertex_properties = torch.randn(2, 4, 3)    # (batch, num_objects, d_attr)
+object_pos = torch.randn(2, 4, 64, 3)       # (batch, num_objects, num_points, 3)
+object_pos_prev = torch.randn(2, 4, 64, 3)
+object_pos_next = torch.randn(2, 4, 64, 3)
+
+# training
+
+loss, loss_breakdown = model(
+    delta_times = delta_times,
+    vertex_properties = vertex_properties,
+    object_pos = object_pos,
+    object_pos_prev = object_pos_prev,
+    object_pos_next = object_pos_next
+)
+
+loss.backward()
+
+# inference (rollout)
+
+wrapper = RigidformerRolloutWrapper(model)
+
+rollout_positions = wrapper(
+    delta_times = delta_times,
+    vertex_properties = vertex_properties,
+    object_positions = [object_pos_prev, object_pos],
+    num_steps = 10
+)
+
+# rollout_positions is a list of length 12 tensors of shape (batch, num_objects, num_points, 3)
+# includes the 2 initial mock positions
+```
+
 ## Citations
 
 ```bibtex
