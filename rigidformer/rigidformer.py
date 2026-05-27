@@ -789,7 +789,7 @@ class Rigidformer(Module):
             object_tokens = attn(filmed, rotary_pos_emb = object_rotary_pos_emb_with_registers, mask = object_mask_with_registers) + object_tokens
 
             filmed = ff_film(object_tokens, time_cond)
-            object_tokens = ff(object_tokens) + object_tokens
+            object_tokens = ff(filmed) + object_tokens
 
             object_hiddens.append(object_tokens)
 
