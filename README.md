@@ -1,6 +1,6 @@
 <img src="./fig2.png" width="400px"></img>
 
-## Rigidformer (wip)
+## Rigidformer
 
 Implementation of [RigidFormer](https://arxiv.org/abs/2605.09196), Learning Rigid Dynamics using Transformers, out of MIT and Meta
 
