@@ -96,3 +96,34 @@ def test_pointnet():
     out = net(features, pos)
 
     assert out.shape == (2, 2, 128)
+
+@param('use_linear_attn', (False, True))
+@param('variable_point_lens', (False, True))
+def test_pointnet_linear_attn(
+    use_linear_attn,
+    variable_point_lens
+):
+    from rigidformer.rigidformer import PointNet
+
+    features = torch.randn(2, 2, 256, 64)
+    pos = torch.randn(2, 2, 256, 3)
+
+    net = PointNet(
+        dim = 64,
+        dim_out = 128,
+        use_linear_attn = use_linear_attn,
+        linear_attn_dim_head = 16,
+        linear_attn_heads = 4
+    )
+
+    kwargs = dict()
+    if variable_point_lens:
+        from torch_einops_utils import lens_to_mask
+        point_lens = torch.tensor([[128, 256], [256, 200]])
+        kwargs['mask'] = lens_to_mask(point_lens, max_len = 256)
+
+    out = net(features, pos, **kwargs)
+
+    assert out.shape == (2, 2, 128)
+
+    out.sum().backward()

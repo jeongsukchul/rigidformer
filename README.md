@@ -90,3 +90,12 @@ rollout_positions = wrapper(
     url     = {https://arxiv.org/abs/2605.09196},
 }
 ```
+
+```bibtex
+@inproceedings{Arora2023ZoologyMA,
+  title   = {Zoology: Measuring and Improving Recall in Efficient Language Models},
+  author  = {Simran Arora and Sabri Eyuboglu and Aman Timalsina and Isys Johnson and Michael Poli and James Zou and Atri Rudra and Christopher R'e},
+  year    = {2023},
+  url     = {https://api.semanticscholar.org/CorpusID:266149332}
+}
+```

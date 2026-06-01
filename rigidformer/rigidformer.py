@@ -15,6 +15,8 @@ from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim, lens_t
 
 from x_mlps_pytorch import MLP
 
+from taylor_series_linear_attention import TaylorSeriesLinearAttn
+
 import roma
 
 # constants
@@ -159,7 +161,10 @@ class PointNetSetAbstract(Module):
         dim_out,
         num_points,
         num_samples,
-        mlp_hidden_dim = None
+        mlp_hidden_dim = None,
+        use_linear_attn = False,
+        linear_attn_dim_head = 16,
+        linear_attn_heads = 4
     ):
         super().__init__()
         self.num_points = num_points
@@ -168,6 +173,13 @@ class PointNetSetAbstract(Module):
         mlp_hidden_dim = default(mlp_hidden_dim, dim_out)
 
         self.mlp = MLP(dim + 3, dim_out, mlp_hidden_dim)
+
+        self.linear_attn = TaylorSeriesLinearAttn(
+            dim = dim_out,
+            dim_head = linear_attn_dim_head,
+            heads = linear_attn_heads,
+            prenorm = True
+        ) if use_linear_attn else None
 
     def forward(
         self,
@@ -193,6 +205,13 @@ class PointNetSetAbstract(Module):
             grouped_features = cat((grouped_pos, grouped_features), dim = -1)
 
             new_features = self.mlp(grouped_features)
+
+            if exists(self.linear_attn):
+                attn_input, inverse_pack = pack_with_inverse(new_features, '* n d')
+                attn_mask = packed_mask if exists(mask) else None
+
+                attn_out = self.linear_attn(attn_input, mask = attn_mask)
+                new_features = new_features + inverse_pack(attn_out)
 
             if exists(mask):
                 mask_value = -torch.finfo(new_features.dtype).max
@@ -225,6 +244,12 @@ class PointNetSetAbstract(Module):
         grouped_features = cat((grouped_pos, grouped_features), dim = -1)
 
         new_features = self.mlp(grouped_features)
+
+        if exists(self.linear_attn):
+            attn_input, inverse_pack = pack_with_inverse(new_features, '* k d')
+            attn_out = self.linear_attn(attn_input)
+            new_features = new_features + inverse_pack(attn_out)
+
         new_features = reduce(new_features, 'b m k d -> b m d', 'max')
 
         return inverse_pack_features(new_features, '* n d'), inverse_pack_pos(new_pos, '* n p')
@@ -237,7 +262,10 @@ class PointNet(Module):
         dim_out,
         num_points: tuple[int | None, ...] = (128, 32, None),
         num_samples: tuple[int | None, ...] = (32, 16, None),
-        expansion_factor: int = 2
+        expansion_factor: int = 2,
+        use_linear_attn = False,
+        linear_attn_dim_head = 16,
+        linear_attn_heads = 4
     ):
         super().__init__()
         assert len(num_points) == len(num_samples)
@@ -256,7 +284,10 @@ class PointNet(Module):
                 dim = dim_in,
                 dim_out = dim_out_layer,
                 num_points = layer_num_points,
-                num_samples = layer_num_samples
+                num_samples = layer_num_samples,
+                use_linear_attn = use_linear_attn,
+                linear_attn_dim_head = linear_attn_dim_head,
+                linear_attn_heads = linear_attn_heads
             ))
 
             dim_in = dim_out_layer
