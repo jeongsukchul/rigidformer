@@ -9,13 +9,15 @@ param = pytest.mark.parametrize
 @param('variable_object_lens', (False, True))
 @param('variable_point_lens', (False, True))
 @param('anchor_self_attn', (False, True))
+@param('use_platonic_transformer', (False, True))
 def test_rigidformer(
     fps,
     test_rand_steps,
     attn_residual_learned_pooling,
     variable_object_lens,
     variable_point_lens,
-    anchor_self_attn
+    anchor_self_attn,
+    use_platonic_transformer
 ):
     from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper, PointNet
 
@@ -30,9 +32,9 @@ def test_rigidformer(
 
     rigidformer = Rigidformer(
         512,
-        hierarchical_encoder = PointNet(dim = 512, dim_out = 512),
         attn_residual_learned_pooling = attn_residual_learned_pooling,
-        anchor_self_attn = anchor_self_attn
+        anchor_self_attn = anchor_self_attn,
+        use_platonic_transformer = use_platonic_transformer
     )
 
     kwargs = dict()
@@ -127,3 +129,45 @@ def test_pointnet_linear_attn(
     assert out.shape == (2, 2, 128)
 
     out.sum().backward()
+
+def test_platonic_transformer():
+    from rigidformer.platonic_transformer import PlatonicTransformer
+
+    features = torch.randn(2, 2, 256, 64)
+    pos = torch.randn(2, 2, 256, 3)
+
+    net = PlatonicTransformer(dim = 64, dim_out = 128)
+    out = net(features, pos)
+
+    assert out.shape == (2, 2, 128)
+    out.sum().backward()
+
+def test_platonic_transformer_invariance():
+    from rigidformer.platonic_transformer import PlatonicTransformer
+    from torch_einops_utils import lens_to_mask
+    from scipy.spatial.transform import Rotation
+
+    # check continuous rotation invariance
+
+    net = PlatonicTransformer(dim = 64, dim_out = 128).eval()
+
+    features = torch.randn(2, 2, 256, 64)
+    pos = torch.randn(2, 2, 256, 3)
+
+    # variable length points
+
+    point_lens = torch.tensor([[128, 256], [256, 200]])
+    mask = lens_to_mask(point_lens, max_len = 256)
+
+    with torch.no_grad():
+        out1 = net(features, pos, mask = mask)
+
+        # apply random 3d rotation from the discrete platonic group
+
+        from rigidformer.platonic_transformer import TETRAHEDRON_ROTATIONS
+        rot = TETRAHEDRON_ROTATIONS[torch.randint(0, 12, (1,)).item()]
+        pos_rotated = pos @ rot.T
+
+        out2 = net(features, pos_rotated, mask = mask)
+
+    assert torch.allclose(out1, out2, atol = 1e-4)

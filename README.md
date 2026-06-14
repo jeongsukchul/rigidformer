@@ -99,3 +99,15 @@ rollout_positions = wrapper(
   url     = {https://api.semanticscholar.org/CorpusID:266149332}
 }
 ```
+
+```bibtex
+@misc{islam2026platonictransformerssolidchoice,
+    title   = {Platonic Transformers: A Solid Choice For Equivariance}, 
+    author  = {Mohammad Mohaiminul Islam and Rishabh Anand and David R. Wessels and Friso de Kruiff and Thijs P. Kuipers and Rex Ying and Clara I. Sánchez and Sharvaree Vadgama and Georg Bökman and Erik J. Bekkers},
+    year    = {2026},
+    eprint  = {2510.03511},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV},
+    url     = {https://arxiv.org/abs/2510.03511}, 
+}
+```

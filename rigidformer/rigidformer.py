@@ -17,6 +17,8 @@ from x_mlps_pytorch import MLP
 
 from taylor_series_linear_attention import TaylorSeriesLinearAttn
 
+from rigidformer.rotary_3d import RotaryEmbedding3D, apply_rotary_pos_emb
+
 import roma
 
 # constants
@@ -305,39 +307,6 @@ class PointNet(Module):
         features = rearrange(features, '... 1 d -> ... d')
         return features
 
-# 3d axial rotary embeddings
-# the anchor rope mentioned is simply where they mean pool rotary embeddings for the 4 anchors, iiuc
-
-class AxialRotaryEmbeddings(Module):
-    def __init__(
-        self,
-        dim,
-        omega = 10_000
-    ):
-        super().__init__()
-        assert divisible_by(dim, 6), f'{dim} must be divisible by 6'
-        inv_freq = omega ** (-torch.arange(0, dim, 6).float() / dim)
-        self.register_buffer('inv_freq', inv_freq)
-
-    @property
-    def device(self):
-        return self.inv_freq.device
-
-    def forward(
-        self,
-        pos, # (... 3)
-    ):
-        freqs = einsum(pos, self.inv_freq, '... p, f -> ... p f')
-        freqs = rearrange(freqs, 'b ... p f -> b 1 ... (p f)')
-        return cat((freqs, freqs), dim = -1)
-
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim = -1)
-    return cat((-x2, x1), dim = -1)
-
-def apply_rotary_pos_emb(pos, t):
-    return t * pos.cos() + rotate_half(t) * pos.sin()
-
 # anchor vertex pooling
 
 # basically a weighted aggregation with the l1norm on the negative exponentiated euclidean distance from anchor to object positions
@@ -600,7 +569,13 @@ class Rigidformer(Module):
             learned_sigma = True
         ),
         vertex_properties_dim = 3,
-        hierarchical_encoder: Module | None = None
+        hierarchical_encoder: Module | None = None,
+        use_platonic_transformer = False,
+        platonic_transformer_kwargs: dict = dict(
+            depth = 2,
+            heads = 4,
+            dim_head = 32
+        )
     ):
         super().__init__()
 
@@ -611,7 +586,11 @@ class Rigidformer(Module):
         self.vertex_encoder = MLP(3 + 3 + 3 + vertex_properties_dim, dim * 2, dim)
 
         if not exists(hierarchical_encoder):
-            hierarchical_encoder = PointNet(dim = dim, dim_out = dim)
+            if use_platonic_transformer:
+                from rigidformer.platonic_transformer import PlatonicTransformer
+                hierarchical_encoder = PlatonicTransformer(dim = dim, dim_out = dim, **platonic_transformer_kwargs)
+            else:
+                hierarchical_encoder = PointNet(dim = dim, dim_out = dim)
 
         self.hierarchical_encoder = hierarchical_encoder
 
@@ -623,7 +602,7 @@ class Rigidformer(Module):
 
         # rotary embeddings
 
-        self.rope_3d = AxialRotaryEmbeddings(dim_head, **axial_rope_kwargs)
+        self.rope_3d = RotaryEmbedding3D(dim_head, **axial_rope_kwargs)
 
         self.register_pos = register_pos # todo - spend some time building / vibing a custom kernel for both rope and pope to be able to omit rotary for certain tokens (registers / cls etc)
 
@@ -798,7 +777,14 @@ class Rigidformer(Module):
 
         # object rotary embeddings
 
+        object_pos_reshaped = rearrange(object_pos, 'b no n p -> b (no n) p')
+        rotary_pos_emb = self.rope_3d(object_pos_reshaped)
+        rotary_pos_emb = rearrange(rotary_pos_emb, 'b ... f -> b 1 ... f')
+
+        # anchor rotary embeddings
+
         anchor_rope = self.rope_3d(anchor_pos)
+        anchor_rope = rearrange(anchor_rope, 'b ... f -> b 1 ... f')
 
         object_rotary_pos_emb = reduce(anchor_rope, 'b h no na f -> b h no f', 'mean') # mean pooled anchor rotary embeddings
         object_rotary_pos_emb_with_registers = pad_left_at_dim(object_rotary_pos_emb, self.num_register_tokens, dim = -2, value = self.register_pos)
