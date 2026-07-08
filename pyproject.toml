@@ -38,7 +38,14 @@ Homepage = "https://pypi.org/project/rigidformer/"
 Repository = "https://codeberg.org/lucidrains/rigidformer"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "imageio",
+    "imageio-ffmpeg",
+    "matplotlib",
+    "tqdm",
+    "trimesh",
+    "wandb",
+]
 test = [
     "pytest"
 ]

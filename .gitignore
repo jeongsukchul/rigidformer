@@ -1,5 +1,10 @@
 uv_publish.sh
 
+# Local datasets and training outputs
+data/
+eval/
+runs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

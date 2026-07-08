@@ -307,6 +307,108 @@ class PointNet(Module):
         features = rearrange(features, '... 1 d -> ... d')
         return features
 
+class PaperHierarchicalPointNet(Module):
+    """Paper-style multi-scale PointNet object encoder.
+
+    Reads per-vertex backbone features and pools four parallel geometry scales:
+    100%, 50%, 25%, and 12.5% of the valid vertices. Each scale is globally
+    summarized and the concatenated representation is projected to the object
+    token dimension.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_out,
+        level_dim = 1024,
+        ratios: tuple[float, ...] = (1., 0.5, 0.25, 0.125),
+        num_samples = 32,
+        hidden_dim = 2048
+    ):
+        super().__init__()
+        self.ratios = ratios
+        self.num_samples = num_samples
+
+        self.level_mlps = ModuleList([
+            MLP(dim + 3, hidden_dim, level_dim)
+            for _ in ratios
+        ])
+
+        self.to_object_token = nn.Sequential(
+            nn.RMSNorm(level_dim * len(ratios)),
+            Linear(level_dim * len(ratios), dim_out)
+        )
+
+    def _level_pool(
+        self,
+        features,
+        pos,
+        mask,
+        *,
+        ratio,
+        mlp
+    ):
+        batch, num_points, _ = pos.shape
+
+        if ratio >= 1.:
+            rel_pos = pos - masked_mean(pos, mask, dim = -2, keepdim = True) if exists(mask) else pos - pos.mean(dim = -2, keepdim = True)
+            point_features = mlp(cat((rel_pos, features), dim = -1))
+
+            if exists(mask):
+                mask_value = -torch.finfo(point_features.dtype).max
+                point_features = einx.where('b n, b n d, -> b n d', mask, point_features, mask_value)
+
+            return reduce(point_features, 'b n d -> b d', 'max')
+
+        if exists(mask):
+            valid_counts = mask.sum(dim = -1)
+            sample_count = int(max(1, min(num_points, (valid_counts.float().max() * ratio).ceil().item())))
+        else:
+            sample_count = max(1, min(num_points, int((num_points * ratio) + 0.999999)))
+
+        sampled_indices = naive_farthest_point_sample(pos, sample_count, mask = mask)
+        sampled_pos = pos.gather(1, pad_right_ndim_to_and_expand_as(sampled_indices, pos))
+
+        dist = cdist(sampled_pos, pos)
+        if exists(mask):
+            dist = einx.where('b n, b m n, -> b m n', mask, dist, INF)
+
+        k = min(self.num_samples, num_points)
+        _, knn_indices = dist.topk(k, dim = -1, largest = False)
+        packed_knn_indices = rearrange(knn_indices, 'b m k -> b (m k)')
+
+        grouped_pos = pos.gather(1, pad_right_ndim_to_and_expand_as(packed_knn_indices, pos))
+        grouped_pos = rearrange(grouped_pos, 'b (m k) p -> b m k p', m = sample_count)
+        grouped_pos = grouped_pos - rearrange(sampled_pos, 'b m p -> b m 1 p')
+
+        grouped_features = features.gather(1, pad_right_ndim_to_and_expand_as(packed_knn_indices, features))
+        grouped_features = rearrange(grouped_features, 'b (m k) d -> b m k d', m = sample_count)
+
+        grouped = cat((grouped_pos, grouped_features), dim = -1)
+        local_features = mlp(grouped)
+        local_features = reduce(local_features, 'b m k d -> b m d', 'max')
+
+        return reduce(local_features, 'b m d -> b d', 'max')
+
+    def forward(
+        self,
+        features,
+        pos,
+        mask = None
+    ):
+        features, inverse_pack_features = pack_with_inverse(features, '* n d')
+        pos, _ = pack_with_inverse(pos, '* n p')
+        mask, _ = pack_with_inverse(mask, '* n') if exists(mask) else (None, None)
+
+        level_features = [
+            self._level_pool(features, pos, mask, ratio = ratio, mlp = mlp)
+            for ratio, mlp in zip(self.ratios, self.level_mlps)
+        ]
+
+        object_token = self.to_object_token(cat(level_features, dim = -1))
+        return inverse_pack_features(object_token, '* d')
+
 # anchor vertex pooling
 
 # basically a weighted aggregation with the l1norm on the negative exponentiated euclidean distance from anchor to object positions
@@ -575,22 +677,37 @@ class Rigidformer(Module):
             depth = 2,
             heads = 4,
             dim_head = 32
-        )
+        ),
+        paper_architecture = False,
+        vertex_feature_dim = None,
+        avp_dim = 256,
+        paper_pointnet_level_dim = 1024
     ):
         super().__init__()
 
+        self.paper_architecture = paper_architecture
         self.vertex_properties_dim = vertex_properties_dim
+        vertex_feature_dim = default(vertex_feature_dim, 1024 if paper_architecture else dim)
+
+        if paper_architecture and vertex_properties_dim != 3:
+            raise ValueError('`paper_architecture` expects 3 physics parameters: mass, friction, restitution')
 
         # vertex encoder
 
-        self.vertex_encoder = MLP(3 + 3 + 3 + vertex_properties_dim, dim * 2, dim)
+        self.vertex_encoder = MLP(3 + 3 + 3 + vertex_properties_dim, vertex_feature_dim * 2, vertex_feature_dim)
 
         if not exists(hierarchical_encoder):
             if use_platonic_transformer:
                 from rigidformer.platonic_transformer import PlatonicTransformer
-                hierarchical_encoder = PlatonicTransformer(dim = dim, dim_out = dim, **platonic_transformer_kwargs)
+                hierarchical_encoder = PlatonicTransformer(dim = vertex_feature_dim, dim_out = dim, **platonic_transformer_kwargs)
+            elif paper_architecture:
+                hierarchical_encoder = PaperHierarchicalPointNet(
+                    dim = vertex_feature_dim,
+                    dim_out = dim,
+                    level_dim = paper_pointnet_level_dim
+                )
             else:
-                hierarchical_encoder = PointNet(dim = dim, dim_out = dim)
+                hierarchical_encoder = PointNet(dim = vertex_feature_dim, dim_out = dim)
 
         self.hierarchical_encoder = hierarchical_encoder
 
@@ -598,7 +715,24 @@ class Rigidformer(Module):
 
         self.anchor_vertex_pool = AnchorVertexPool(**anchor_vertex_pool_kwargs)
 
-        self.pooled_object_to_anchor = MLP(dim, dim * 4, dim)
+        self.pooled_object_to_anchor = MLP(vertex_feature_dim, dim * 4, dim)
+
+        if paper_architecture:
+            self.avp_to_anchor_feature = nn.Sequential(
+                Linear(vertex_feature_dim, avp_dim),
+                nn.SiLU(),
+                Linear(avp_dim, avp_dim)
+            )
+            nn.init.zeros_(self.avp_to_anchor_feature[-1].weight)
+            nn.init.zeros_(self.avp_to_anchor_feature[-1].bias)
+
+            self.anchor_query_proj = nn.Sequential(
+                Linear(avp_dim + 15, dim),
+                nn.SiLU(),
+                Linear(dim, dim)
+            )
+
+            self.multi_scale_fuse = Linear(dim * anchor_cross_attn_depth, dim)
 
         # rotary embeddings
 
@@ -676,10 +810,18 @@ class Rigidformer(Module):
 
         self.cross_attn_layers = layers
 
-        self.to_acc_pred = nn.Sequential(
-            nn.RMSNorm(dim),
-            Linear(dim, 3, bias = False)
-        )
+        if paper_architecture:
+            self.to_acc_pred = nn.Sequential(
+                nn.RMSNorm(dim),
+                Linear(dim, dim * 2),
+                nn.SiLU(),
+                Linear(dim * 2, 3, bias = False)
+            )
+        else:
+            self.to_acc_pred = nn.Sequential(
+                nn.RMSNorm(dim),
+                Linear(dim, 3, bias = False)
+            )
 
         # loss related
 
@@ -735,7 +877,10 @@ class Rigidformer(Module):
         assert exists(vertex_properties), 'vertex_properties must be passed in'
 
         if vertex_properties.ndim == 3: # (b, no, d_attr)
+            object_properties = vertex_properties
             vertex_properties = repeat(vertex_properties, 'b no d -> b no n d', n = object_pos.shape[-2])
+        else:
+            object_properties = vertex_properties[..., 0, :]
 
         combined_mask = None
         if exists(object_mask) and exists(object_point_mask):
@@ -761,7 +906,25 @@ class Rigidformer(Module):
 
         pooled_vertex_tokens, anchor_pos = self.anchor_vertex_pool(vertex_tokens, object_pos, anchor_indices, mask = object_point_mask)
 
-        anchor_tokens = self.pooled_object_to_anchor(pooled_vertex_tokens)
+        if self.paper_architecture:
+            anchor_pos_first_frame = object_first_frame_pos.gather(-2, anchor_indices_spatial)
+            anchor_velocity = anchor_pos - anchor_pos_prev
+            anchor_reference_offset = anchor_pos - anchor_pos_first_frame
+            anchor_nearest_neighbor_disp = nearest_neighbor_disp.gather(-2, anchor_indices_spatial)
+            anchor_properties = repeat(object_properties, 'b no d -> b no na d', na = self.num_anchors)
+
+            anchor_state = cat((
+                anchor_pos,
+                anchor_velocity,
+                anchor_reference_offset,
+                anchor_nearest_neighbor_disp,
+                anchor_properties
+            ), dim = -1)
+
+            avp_tokens = self.avp_to_anchor_feature(pooled_vertex_tokens)
+            anchor_tokens = self.anchor_query_proj(cat((anchor_state, avp_tokens), dim = -1))
+        else:
+            anchor_tokens = self.pooled_object_to_anchor(pooled_vertex_tokens)
 
         # time conditioning
 
@@ -816,33 +979,70 @@ class Rigidformer(Module):
 
         anchor_tokens, inverse_pack_objects_num_anchors = pack_with_inverse(anchor_tokens, 'b * d')
 
-        anchor_hiddens = [anchor_tokens]
-
         anchor_mask = repeat(object_mask, 'b no -> b (no na)', na = self.num_anchors) if exists(object_mask) else None
 
-        for ind, (self_attn_film, self_attn, attn_film, attn, ff_film, ff, attn_residual, context_attn_residual) in enumerate(self.cross_attn_layers):
+        if self.paper_architecture:
+            base_anchor_tokens = anchor_tokens
+            scale_outputs = []
 
-            if exists(self_attn):
-                filmed_self = self_attn_film(anchor_tokens, time_cond)
-                anchor_tokens = self_attn(filmed_self, rotary_pos_emb = anchor_rotary_pos_emb, mask = anchor_mask) + anchor_tokens
+            for ind, (self_attn_film, self_attn, attn_film, attn, ff_film, ff, attn_residual, context_attn_residual) in enumerate(self.cross_attn_layers):
 
-            if self.learned_object_hidden_layers:
-                object_context = context_attn_residual(object_hiddens)
-            else:
-                object_layer_index = self.object_hidden_layers[ind]
-                object_context = object_hiddens[object_layer_index]
+                scale_anchor_tokens = base_anchor_tokens
 
-            _, object_context = inverse_pack_registers(object_context) # remove register tokens
+                if exists(self_attn):
+                    filmed_self = self_attn_film(scale_anchor_tokens, time_cond)
+                    scale_anchor_tokens = self_attn(filmed_self, rotary_pos_emb = anchor_rotary_pos_emb, mask = anchor_mask) + scale_anchor_tokens
 
-            filmed = attn_film(anchor_tokens, time_cond)
-            anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context, mask = object_mask) + anchor_tokens
+                if self.learned_object_hidden_layers:
+                    object_context = context_attn_residual(object_hiddens)
+                else:
+                    object_layer_index = self.object_hidden_layers[ind]
+                    object_context = object_hiddens[object_layer_index]
 
-            filmed = ff_film(anchor_tokens, time_cond)
-            anchor_tokens = ff(filmed) + anchor_tokens
+                _, object_context = inverse_pack_registers(object_context) # remove register tokens
 
-            anchor_hiddens.append(anchor_tokens)
+                filmed = attn_film(scale_anchor_tokens, time_cond)
+                scale_anchor_tokens = attn(
+                    filmed,
+                    rotary_pos_emb = anchor_rotary_pos_emb,
+                    context_rotary_pos_emb = object_rotary_pos_emb,
+                    context = object_context,
+                    mask = object_mask
+                ) + scale_anchor_tokens
 
-            anchor_tokens = attn_residual(anchor_hiddens)
+                filmed = ff_film(scale_anchor_tokens, time_cond)
+                scale_anchor_tokens = ff(filmed) + scale_anchor_tokens
+
+                scale_outputs.append(scale_anchor_tokens)
+
+            anchor_tokens = self.multi_scale_fuse(cat(scale_outputs, dim = -1)) + base_anchor_tokens
+
+        else:
+            anchor_hiddens = [anchor_tokens]
+
+            for ind, (self_attn_film, self_attn, attn_film, attn, ff_film, ff, attn_residual, context_attn_residual) in enumerate(self.cross_attn_layers):
+
+                if exists(self_attn):
+                    filmed_self = self_attn_film(anchor_tokens, time_cond)
+                    anchor_tokens = self_attn(filmed_self, rotary_pos_emb = anchor_rotary_pos_emb, mask = anchor_mask) + anchor_tokens
+
+                if self.learned_object_hidden_layers:
+                    object_context = context_attn_residual(object_hiddens)
+                else:
+                    object_layer_index = self.object_hidden_layers[ind]
+                    object_context = object_hiddens[object_layer_index]
+
+                _, object_context = inverse_pack_registers(object_context) # remove register tokens
+
+                filmed = attn_film(anchor_tokens, time_cond)
+                anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context, mask = object_mask) + anchor_tokens
+
+                filmed = ff_film(anchor_tokens, time_cond)
+                anchor_tokens = ff(filmed) + anchor_tokens
+
+                anchor_hiddens.append(anchor_tokens)
+
+                anchor_tokens = attn_residual(anchor_hiddens)
 
         anchor_tokens = inverse_pack_objects_num_anchors(anchor_tokens)
 

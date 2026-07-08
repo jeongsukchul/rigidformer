@@ -149,7 +149,6 @@ class PlatonicTransformer(Module):
         g = self.rotations.shape[0]
         
         # lift
-        
         features = repeat(features, '... n d -> ... g n d', g = g)
 
         pos_g = einsum('... n c, g r c -> ... g n r', pos, self.rotations)
