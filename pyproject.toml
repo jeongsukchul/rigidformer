@@ -31,14 +31,6 @@ dependencies = [
     "torch>=2.5",
     "torch-einops-utils>=0.1.1",
     "x-mlps-pytorch",
-]
-
-[project.urls]
-Homepage = "https://pypi.org/project/rigidformer/"
-Repository = "https://codeberg.org/lucidrains/rigidformer"
-
-[project.optional-dependencies]
-examples = [
     "imageio",
     "imageio-ffmpeg",
     "matplotlib",
@@ -46,6 +38,12 @@ examples = [
     "trimesh",
     "wandb",
 ]
+
+[project.urls]
+Homepage = "https://pypi.org/project/rigidformer/"
+Repository = "https://codeberg.org/lucidrains/rigidformer"
+
+
 test = [
     "pytest"
 ]

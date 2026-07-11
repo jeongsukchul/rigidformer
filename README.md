@@ -12,6 +12,15 @@ $ pip install rigidformer
 
 ## Usage
 
+```bash
+python scripts/train_movi.py \
+  --dataset-dir data/movi/MOVi-B \
+  --objects-dir data/movi_objects/objects \
+  --output-dir runs/rigidformer-movib \
+  --wandb \
+  --amp
+```
+
 ```python
 import torch
 from rigidformer import Rigidformer
