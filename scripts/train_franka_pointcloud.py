@@ -130,9 +130,23 @@ def _make_loader(input_file: Path, split: str, args: argparse.Namespace, *, shuf
     )
 
 
-def _render_episode_index(args: argparse.Namespace) -> int:
+def _render_episode_indices(args: argparse.Namespace) -> list[int]:
     if args.render_episode_index is not None:
-        return int(args.render_episode_index)
+        start = int(args.render_episode_index)
+        stop = start + int(args.render_num_episodes)
+        all_indices = franka_pointcloud_episode_indices(
+            args.input_file,
+            split="all",
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+        )
+        if stop > len(all_indices):
+            raise IndexError(
+                f"render-episode-index range [{start}, {stop}) out of range "
+                f"for dataset with {len(all_indices)} episodes"
+            )
+        return list(range(start, stop))
 
     indices = franka_pointcloud_episode_indices(
         args.input_file,
@@ -141,13 +155,14 @@ def _render_episode_index(args: argparse.Namespace) -> int:
         val_ratio=args.val_ratio,
         seed=args.seed,
     )
-    if args.render_sample_index >= len(indices):
+    stop = int(args.render_sample_index) + int(args.render_num_episodes)
+    if stop > len(indices):
         raise IndexError(
-            f"render-sample-index {args.render_sample_index} out of range "
+            f"render sample range [{args.render_sample_index}, {stop}) out of range "
             f"for split {args.render_split!r} with {len(indices)} episodes"
         )
 
-    return int(indices[args.render_sample_index])
+    return [int(index) for index in indices[int(args.render_sample_index) : stop]]
 
 
 def _render_training_rollout(
@@ -160,66 +175,101 @@ def _render_training_rollout(
     global_step: int,
     wandb_run: Any | None,
 ) -> dict[str, Any]:
-    episode_index = _render_episode_index(args)
+    episode_indices = _render_episode_indices(args)
     output_dir = args.output_dir / "renders" / f"epoch_{epoch + 1:04d}"
     render_max_points = args.render_max_points or args.max_points
+    all_metrics: list[dict[str, Any]] = []
 
     was_training = model.training
     model.eval()
     try:
-        metrics = render_franka_pointcloud_rollout(
-            model,
-            args.input_file,
-            output_dir,
-            episode_index=episode_index,
-            start_frame=args.render_start_frame,
-            steps=args.render_steps,
-            stride=args.render_stride,
-            max_points=render_max_points,
-            random_points=args.render_random_points,
-            seed=args.seed,
-            video_fps=args.render_video_fps,
-            teacher_force_context=args.render_teacher_force_context,
-            device=device,
-            use_amp=use_amp,
-            show_progress=not args.disable_render_tqdm,
-        )
+        for render_slot, episode_index in enumerate(episode_indices):
+            episode_output_dir = (
+                output_dir
+                if len(episode_indices) == 1
+                else output_dir / f"episode_{render_slot:02d}_idx_{episode_index:06d}"
+            )
+            metrics = render_franka_pointcloud_rollout(
+                model,
+                args.input_file,
+                episode_output_dir,
+                episode_index=episode_index,
+                start_frame=args.render_start_frame,
+                steps=args.render_steps,
+                stride=args.render_stride,
+                max_points=render_max_points,
+                random_points=args.render_random_points,
+                seed=args.seed + render_slot,
+                video_fps=args.render_video_fps,
+                teacher_force_context=args.render_teacher_force_context,
+                device=device,
+                use_amp=use_amp,
+                show_progress=not args.disable_render_tqdm,
+            )
+            metrics.update(
+                {
+                    "event": "render",
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "input_file": str(args.input_file),
+                    "render_slot": render_slot,
+                    "render_count": len(episode_indices),
+                }
+            )
+            all_metrics.append(metrics)
+            print(json.dumps(metrics), flush=True)
     finally:
         model.train(was_training)
 
-    metrics.update(
-        {
-            "event": "render",
-            "epoch": epoch + 1,
-            "global_step": global_step,
-            "input_file": str(args.input_file),
-        }
-    )
-    print(json.dumps(metrics), flush=True)
+    summary = {
+        "event": "render_summary",
+        "epoch": epoch + 1,
+        "global_step": global_step,
+        "input_file": str(args.input_file),
+        "render_count": len(all_metrics),
+        "episode_indices": episode_indices,
+        "rmse_mean_rollout_only": float(np.nanmean([m["rmse_mean_rollout_only"] for m in all_metrics])),
+        "rmse_final": float(np.nanmean([m["rmse_final"] for m in all_metrics])),
+        "pose_position_rmse_rollout": float(np.nanmean([m["pose_position_rmse_rollout"] for m in all_metrics])),
+        "pose_orientation_rmse_deg_rollout": float(
+            np.nanmean([m["pose_orientation_rmse_deg_rollout"] for m in all_metrics])
+        ),
+    }
+    print(json.dumps(summary), flush=True)
 
     if wandb_run is not None:
         import wandb
 
-        wandb_run.log(
-            {
-                "global_step": global_step,
-                "render/epoch": epoch + 1,
-                "render/episode_index": episode_index,
-                "render/rmse_mean_all_frames": metrics["rmse_mean_all_frames"],
-                "render/rmse_mean_rollout_only": metrics["rmse_mean_rollout_only"],
-                "render/rmse_final": metrics["rmse_final"],
-                "render/rmse_all_objects_mean": metrics["rmse_all_objects_mean"],
-                "render/rmse_all_objects_final": metrics["rmse_all_objects_final"],
-                "render/pose_position_rmse_rollout": metrics["pose_position_rmse_rollout"],
-                "render/pose_orientation_rmse_deg_rollout": metrics["pose_orientation_rmse_deg_rollout"],
-                "render/final_overlay": wandb.Image(metrics["final_overlay"]),
-                "render/rmse_plot": wandb.Image(metrics["rmse_plot"]),
-                "render/pose_error_plot": wandb.Image(metrics["pose_error_plot"]),
-                "render/rollout": wandb.Video(metrics["video"], fps=args.render_video_fps, format="mp4"),
-            }
-        )
+        payload: dict[str, Any] = {
+            "global_step": global_step,
+            "render/epoch": epoch + 1,
+            "render/count": len(all_metrics),
+            "render/rmse_mean_rollout_only": summary["rmse_mean_rollout_only"],
+            "render/rmse_final": summary["rmse_final"],
+            "render/pose_position_rmse_rollout": summary["pose_position_rmse_rollout"],
+            "render/pose_orientation_rmse_deg_rollout": summary["pose_orientation_rmse_deg_rollout"],
+        }
+        for render_slot, metrics in enumerate(all_metrics):
+            prefix = "render" if len(all_metrics) == 1 else f"render/episode_{render_slot:02d}"
+            payload.update(
+                {
+                    f"{prefix}/episode_index": metrics["episode_index"],
+                    f"{prefix}/rmse_mean_all_frames": metrics["rmse_mean_all_frames"],
+                    f"{prefix}/rmse_mean_rollout_only": metrics["rmse_mean_rollout_only"],
+                    f"{prefix}/rmse_final": metrics["rmse_final"],
+                    f"{prefix}/rmse_all_objects_mean": metrics["rmse_all_objects_mean"],
+                    f"{prefix}/rmse_all_objects_final": metrics["rmse_all_objects_final"],
+                    f"{prefix}/pose_position_rmse_rollout": metrics["pose_position_rmse_rollout"],
+                    f"{prefix}/pose_orientation_rmse_deg_rollout": metrics["pose_orientation_rmse_deg_rollout"],
+                    f"{prefix}/final_overlay": wandb.Image(metrics["final_overlay"]),
+                    f"{prefix}/rmse_plot": wandb.Image(metrics["rmse_plot"]),
+                    f"{prefix}/pose_error_plot": wandb.Image(metrics["pose_error_plot"]),
+                    f"{prefix}/rollout": wandb.Video(metrics["video"], fps=args.render_video_fps, format="mp4"),
+                }
+            )
+        wandb_run.log(payload)
 
-    return metrics
+    return summary
 
 
 def _learning_rate(
@@ -343,14 +393,14 @@ def main() -> None:
     parser.add_argument("--input-file", type=Path, required=True, help="Calibrated HDF5 from calibrate_franka_pointcloud.py.")
     parser.add_argument("--output-dir", type=Path, default=Path("runs/rigidformer-franka-pointcloud"))
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--steps-per-epoch", type=int, default=0, help="0 means use the whole train split.")
     parser.add_argument("--sample-count", type=int, default=None, help="Limit train samples for debugging.")
     parser.add_argument("--val-sample-count", type=int, default=None, help="Limit validation samples for debugging.")
     parser.add_argument("--train-ratio", type=float, default=0.9)
     parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--val-every", type=int, default=5, help="Validate every N epochs. 0 disables validation.")
+    parser.add_argument("--val-every", type=int, default=1, help="Validate every N epochs. 0 disables validation.")
     parser.add_argument("--val-steps", type=int, default=50)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--disable-tqdm", action="store_true")
@@ -368,10 +418,11 @@ def main() -> None:
     )
     parser.add_argument("--wandb-watch", action="store_true", help="Log model gradients/parameters to WandB.")
     parser.add_argument("--wandb-log-checkpoints", action="store_true", help="Upload latest checkpoints as WandB artifacts.")
-    parser.add_argument("--save-every", type=int, default=10, help="Save checkpoints every N epochs; final is always saved.")
-    parser.add_argument("--render-every", type=int, default=10, help="Render a validation rollout every N epochs. Set 0 to disable.")
+    parser.add_argument("--save-every", type=int, default=1, help="Save checkpoints every N epochs; final is always saved.")
+    parser.add_argument("--render-every", type=int, default=1, help="Render a validation rollout every N epochs. Set 0 to disable.")
     parser.add_argument("--render-split", type=str, default="val", choices=("train", "val", "test", "all"))
     parser.add_argument("--render-sample-index", type=int, default=0, help="Episode index within --render-split.")
+    parser.add_argument("--render-num-episodes", type=int, default=4, help="Number of consecutive episodes to render.")
     parser.add_argument("--render-episode-index", type=int, default=None, help="Absolute episode index. Overrides --render-sample-index.")
     parser.add_argument("--render-start-frame", type=int, default=0)
     parser.add_argument("--render-steps", type=int, default=48)
@@ -450,6 +501,8 @@ def main() -> None:
         raise ValueError("Expected --render-every >= 0")
     if args.render_sample_index < 0:
         raise ValueError("Expected --render-sample-index >= 0")
+    if args.render_num_episodes < 1:
+        raise ValueError("Expected --render-num-episodes >= 1")
     if args.render_episode_index is not None and args.render_episode_index < 0:
         raise ValueError("Expected --render-episode-index >= 0")
     if args.render_start_frame < 0:

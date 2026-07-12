@@ -365,7 +365,10 @@ def rollout_franka_pointcloud_model(
     vertex_properties = vertex_properties.unsqueeze(0).to(device)
     first_frame_pos = first_frame_pos.unsqueeze(0).to(device)
     delta_times = torch.tensor([delta_time], dtype=torch.float32, device=device)
-    context_mask = ~loss_object_mask[:object_lens].bool().to(device)
+    context_mask = ~loss_object_mask[:object_lens].bool()
+    context_mask_positions = context_mask.to(positions.device)
+    context_mask_device = context_mask.to(device)
+    has_context = bool(context_mask.any().item())
 
     prev = positions[0].unsqueeze(0).to(device)
     current = positions[1].unsqueeze(0).to(device)
@@ -399,9 +402,10 @@ def rollout_franka_pointcloud_model(
             anchor_indices = intermediates.anchor_indices
 
         next_pos = pred.object_pos_next.detach()
-        if teacher_force_context and bool(context_mask.any().item()):
+        if teacher_force_context and has_context:
             next_pos = next_pos.clone()
-            next_pos[:, context_mask] = positions[offset + 2, context_mask].unsqueeze(0).to(device)
+            context_pos = positions[offset + 2, context_mask_positions].unsqueeze(0).to(device)
+            next_pos[:, context_mask_device] = context_pos
 
         predicted.append(next_pos.cpu())
         prev, current = current, next_pos
