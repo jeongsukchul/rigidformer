@@ -14,6 +14,11 @@ from rigidformer.movi import (
     movi_collate_fn
 )
 
+from rigidformer.franka_pointcloud import (
+    FrankaPointCloudRigidDataset,
+    franka_pointcloud_collate_fn
+)
+
 from rigidformer.pose_metrics import (
     estimate_rigid_transform,
     pose_errors_from_point_trajectories,

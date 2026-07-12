@@ -844,11 +844,18 @@ class Rigidformer(Module):
         anchor_indices = None,          # (b no na)
         object_point_lens = None,       # (b no)
         object_lens = None,             # (b)
+        loss_object_mask = None,        # (b no), optional mask for supervised objects when object_pos_next is passed
         return_intermediates = False
     ):
         batch, max_num_objects = object_pos.shape[:2]
 
         object_mask = lens_to_mask(object_lens, max_len = max_num_objects) if exists(object_lens) else None
+        if exists(loss_object_mask):
+            loss_object_mask = loss_object_mask.bool()
+            loss_object_mask = loss_object_mask[:, :max_num_objects]
+            object_loss_mask = einx.logical_and('b no, b no -> b no', object_mask, loss_object_mask) if exists(object_mask) else loss_object_mask
+        else:
+            object_loss_mask = object_mask
         object_point_mask = lens_to_mask(object_point_lens, max_len = object_pos.shape[-2]) if exists(object_point_lens) else None
 
         # maybe fps
@@ -1105,8 +1112,8 @@ class Rigidformer(Module):
         acc_loss = loss_fn(pred_acc, anchor_acc) + loss_fn(pred_acc_rigid, anchor_acc)
         pos_loss = loss_fn(pred_anchor_pos_next, anchor_pos_next) + loss_fn(pred_pos_next_rigid, anchor_pos_next)
 
-        acc_loss = masked_mean(acc_loss, object_mask)
-        pos_loss = masked_mean(pos_loss, object_mask)
+        acc_loss = masked_mean(acc_loss, object_loss_mask)
+        pos_loss = masked_mean(pos_loss, object_loss_mask)
 
         total_loss = (
             acc_loss * self.acc_loss_weight +
