@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -76,6 +77,46 @@ def _batch_to_model_kwargs(batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         "object_point_lens": batch["object_point_lens"],
         "loss_object_mask": batch["loss_object_mask"],
     }
+
+
+def _vertex_property_summary(input_file: Path) -> dict[str, Any]:
+    with h5py.File(input_file, "r", locking=False) as file:
+        data = file["data"]
+        if "vertex_properties" not in data:
+            return {"vertex_properties_present": False}
+
+        props = np.asarray(data["vertex_properties"], dtype=np.float32)
+        config = json.loads(str(file.attrs.get("rigidformer_pointcloud_config", "{}")))
+        object_names = [
+            name.decode("utf-8") if isinstance(name, bytes) else str(name)
+            for name in np.asarray(data.get("object_names", []))
+        ]
+
+    flat = props.reshape(-1, props.shape[-1])
+    summary: dict[str, Any] = {
+        "vertex_properties_present": True,
+        "vertex_properties_shape": list(props.shape),
+        "vertex_properties_semantics": config.get("vertex_properties_semantics", "unknown"),
+        "physics_properties": bool(config.get("physics_properties", False)),
+        "vertex_properties_min": flat.min(axis=0).tolist(),
+        "vertex_properties_max": flat.max(axis=0).tolist(),
+        "vertex_properties_mean": flat.mean(axis=0).tolist(),
+    }
+
+    if props.ndim == 3 and props.shape[1] == len(object_names):
+        per_object: dict[str, Any] = {}
+        for object_index, object_name in enumerate(object_names):
+            values = props[:, object_index, :]
+            per_object[object_name] = {
+                "min": values.min(axis=0).tolist(),
+                "max": values.max(axis=0).tolist(),
+                "mean": values.mean(axis=0).tolist(),
+            }
+        summary["vertex_properties_per_object"] = per_object
+    else:
+        summary["vertex_properties_values"] = props.tolist()
+
+    return summary
 
 
 def _z_rotation_matrix(angle_degrees: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -532,6 +573,7 @@ def main() -> None:
     steps_per_epoch = args.steps_per_epoch or len(train_loader)
     warmup_steps = args.warmup_steps or int(round(args.warmup_epochs * steps_per_epoch))
     args.effective_warmup_steps = warmup_steps
+    vertex_property_summary = _vertex_property_summary(args.input_file)
 
     config = _jsonable_args(args)
     with (args.output_dir / "config.json").open("w") as f:
@@ -550,6 +592,7 @@ def main() -> None:
         "stride_choices": args.parsed_stride_choices,
         "warmup_steps": warmup_steps,
         "epochs": args.epochs,
+        **vertex_property_summary,
     }
     print(json.dumps(startup_metrics), flush=True)
 

@@ -36,6 +36,8 @@ OBJECT_NAMES = ("cube", "gripper")
 
 
 FRANKA_MESH_DIR_CANDIDATES = (
+    Path("/home/sukchul/IsaacLab/scripts/world_model/rigidformer/data/franka_objects/gripper_meshes"),
+    Path("/home/sukchul/IsaacLab/scripts/world_model/rigidformer/data/franka_drop_objects/gripper_meshes"),
     Path("/home/sukchul/miniconda3/envs/torch/lib/python3.11/site-packages/isaacsim/exts")
     / "isaacsim.asset.importer.urdf/data/urdf/robots/franka_description/meshes/collision",
     Path("/home/sukchul/miniconda3/envs/torch/lib/python3.11/site-packages/mani_skill/assets/robots/panda")
@@ -43,6 +45,8 @@ FRANKA_MESH_DIR_CANDIDATES = (
     Path("/home/sukchul/world_model/neural-robot-dynamics/envs/warp_sim_envs/assets")
     / "franka_description/meshes/collision",
 )
+
+MESH_EXTENSIONS = (".obj", ".stl")
 
 
 def parse_cli() -> argparse.Namespace:
@@ -59,11 +63,35 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--franka-mesh-dir",
         default=None,
-        help="Directory containing Panda collision hand.stl and finger.stl. Auto-detected if omitted.",
+        help="Directory containing Panda collision hand/finger meshes as .obj or .stl. Auto-detected if omitted.",
     )
     parser.add_argument("--hand-mesh", default=None, help="Optional explicit Franka/Panda hand mesh path.")
     parser.add_argument("--finger-mesh", default=None, help="Optional explicit Franka/Panda finger mesh path.")
     parser.add_argument("--train-object", choices=("cube", "both"), default="cube")
+    parser.add_argument(
+        "--physics-properties",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Store per-episode vertex_properties as [mass, friction, restitution] from the source/drop HDF5. "
+            "If disabled, store the old constant object-tag properties."
+        ),
+    )
+    parser.add_argument(
+        "--friction-field",
+        choices=("static", "dynamic"),
+        default="dynamic",
+        help=(
+            "Which Isaac material friction coefficient to use as RigidFormer's single friction property. "
+            "Isaac material_properties are interpreted as [static_friction, dynamic_friction, restitution]."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-properties",
+        choices=("zeros", "tag"),
+        default="zeros",
+        help="Physics/property vector for the gripper object. 'zeros' keeps physics semantics; 'tag' uses the old [0,1,0].",
+    )
     parser.add_argument("--point-dtype", choices=("float32", "float16"), default="float16")
     parser.add_argument("--compression", choices=("gzip", "lzf", "none"), default="gzip")
     parser.add_argument("--gzip-level", type=int, choices=range(1, 10), default=4)
@@ -106,18 +134,20 @@ def resolve_franka_mesh_paths(args: argparse.Namespace) -> tuple[Path, Path, Pat
 
     if args.franka_mesh_dir:
         path = Path(args.franka_mesh_dir).expanduser().resolve()
-        hand_path = path / "hand.stl"
-        finger_path = path / "finger.stl"
-        if not hand_path.is_file() or not finger_path.is_file():
-            raise FileNotFoundError(f"Expected hand.stl and finger.stl in {path}")
+        hand_path = next((path / f"hand{ext}" for ext in MESH_EXTENSIONS if (path / f"hand{ext}").is_file()), None)
+        finger_path = next((path / f"finger{ext}" for ext in MESH_EXTENSIONS if (path / f"finger{ext}").is_file()), None)
+        if hand_path is None or finger_path is None:
+            raise FileNotFoundError(f"Expected hand/finger meshes as .obj or .stl in {path}")
         return hand_path, finger_path, path
 
     for path in FRANKA_MESH_DIR_CANDIDATES:
-        if (path / "hand.stl").is_file() and (path / "finger.stl").is_file():
-            return path / "hand.stl", path / "finger.stl", path
+        hand_path = next((path / f"hand{ext}" for ext in MESH_EXTENSIONS if (path / f"hand{ext}").is_file()), None)
+        finger_path = next((path / f"finger{ext}" for ext in MESH_EXTENSIONS if (path / f"finger{ext}").is_file()), None)
+        if hand_path is not None and finger_path is not None:
+            return hand_path, finger_path, path
 
     raise FileNotFoundError(
-        "Could not auto-detect Franka collision meshes. Pass --franka-mesh-dir containing hand.stl and finger.stl."
+        "Could not auto-detect Franka collision meshes. Pass --franka-mesh-dir containing hand/finger .obj or .stl."
     )
 
 
@@ -384,6 +414,64 @@ def joint_position_trajectory(episode: h5py.Group, steps: int) -> np.ndarray:
     return np.asarray(episode["states/articulation/robot/joint_position"][:steps], dtype=np.float32)
 
 
+def _first_finite_scalar(array: np.ndarray, *, name: str) -> float:
+    flat = np.asarray(array, dtype=np.float32).reshape(-1)
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        raise ValueError(f"{name} contains no finite values.")
+    return float(finite[0])
+
+
+def _first_material_triplet(array: np.ndarray) -> np.ndarray:
+    material = np.asarray(array, dtype=np.float32)
+    if material.size < 3:
+        raise ValueError(f"Material properties must contain at least 3 values, got shape {material.shape}.")
+    material = material.reshape(-1, 3)
+    finite_rows = material[np.isfinite(material).all(axis=1)]
+    if finite_rows.size == 0:
+        raise ValueError(f"Material properties contain no finite triplet, got shape {material.shape}.")
+    return finite_rows[0].astype(np.float32)
+
+
+def cube_physics_properties(episode: h5py.Group, *, friction_field: str) -> np.ndarray:
+    """Return [mass, friction, restitution] for the cube in one episode."""
+    if "episode_physics_randomization/object_mass" in episode:
+        mass = _first_finite_scalar(episode["episode_physics_randomization/object_mass"], name="object_mass")
+    elif "object_dynamics/mass" in episode:
+        mass = _first_finite_scalar(episode["object_dynamics/mass"], name="object_dynamics/mass")
+    else:
+        raise KeyError("Episode has no object mass at episode_physics_randomization/object_mass or object_dynamics/mass.")
+
+    if "episode_physics_randomization/object_contact" in episode:
+        material = _first_material_triplet(episode["episode_physics_randomization/object_contact"])
+    elif "object_dynamics/material_properties" in episode:
+        material = _first_material_triplet(episode["object_dynamics/material_properties"])
+    else:
+        raise KeyError(
+            "Episode has no material properties at episode_physics_randomization/object_contact "
+            "or object_dynamics/material_properties."
+        )
+
+    friction_index = 0 if friction_field == "static" else 1
+    return np.asarray([mass, float(material[friction_index]), float(material[2])], dtype=np.float32)
+
+
+def gripper_property_vector(args: argparse.Namespace) -> np.ndarray:
+    if args.gripper_properties == "tag":
+        return np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    return np.zeros((3,), dtype=np.float32)
+
+
+def legacy_tag_properties() -> np.ndarray:
+    return np.asarray(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+
 def create_or_open_output(
     args: argparse.Namespace,
     *,
@@ -413,6 +501,18 @@ def create_or_open_output(
         if points.shape != expected_shape:
             file.close()
             raise RuntimeError(f"Cannot resume with shape {points.shape}; expected {expected_shape}")
+        expected_props_shape = (
+            (len(episode_names), len(OBJECT_NAMES), 3)
+            if bool(args.physics_properties)
+            else (len(OBJECT_NAMES), 3)
+        )
+        current_props_shape = file["data/vertex_properties"].shape if "vertex_properties" in file["data"] else None
+        if current_props_shape != expected_props_shape:
+            file.close()
+            raise RuntimeError(
+                "Cannot resume with incompatible /data/vertex_properties shape "
+                f"{current_props_shape}; expected {expected_props_shape}."
+            )
         return file
 
     data = file.require_group("data")
@@ -435,16 +535,15 @@ def create_or_open_output(
     data.create_dataset("done", data=np.zeros((len(episode_names),), dtype=bool), chunks=(min(len(episode_names), 1024),))
     data.create_dataset("object_names", data=np.asarray(OBJECT_NAMES, dtype=object), dtype=h5py.string_dtype("utf-8"))
     data.create_dataset("episode_names", data=np.asarray(episode_names, dtype=object), dtype=h5py.string_dtype("utf-8"))
-    data.create_dataset(
-        "vertex_properties",
-        data=np.asarray(
-            [
-                [1.0, 0.0, 1.0],
-                [0.0, 1.0, 0.0],
-            ],
+    if bool(args.physics_properties):
+        data.create_dataset(
+            "vertex_properties",
+            shape=(len(episode_names), len(OBJECT_NAMES), 3),
             dtype=np.float32,
-        ),
-    )
+            chunks=(min(len(episode_names), 1024), len(OBJECT_NAMES), 3),
+        )
+    else:
+        data.create_dataset("vertex_properties", data=legacy_tag_properties())
     if args.train_object == "cube":
         loss_mask = np.asarray([True, False], dtype=bool)
     else:
@@ -468,6 +567,15 @@ def create_or_open_output(
             "objects": list(OBJECT_NAMES),
             "train_object": args.train_object,
             "point_dtype": args.point_dtype,
+            "physics_properties": bool(args.physics_properties),
+            "vertex_properties_semantics": (
+                f"per-episode [mass, {args.friction_field}_friction, restitution] for cube; "
+                f"gripper={args.gripper_properties}"
+                if bool(args.physics_properties)
+                else "legacy constant object tags"
+            ),
+            "friction_field": str(args.friction_field),
+            "gripper_properties": str(args.gripper_properties),
             "cube_size": float(args.cube_size),
             "cube_obj": os.path.abspath(args.cube_obj) if args.cube_obj else None,
             "franka_mesh_dir": str(mesh_dir) if mesh_dir is not None else None,
@@ -539,6 +647,13 @@ def main() -> str:
                 cube_poses = cube_pose_trajectory(episode)[:steps]
                 robot_poses = robot_pose_trajectory(episode, steps)
                 joint_positions = joint_position_trajectory(episode, steps)
+
+                if bool(args.physics_properties):
+                    out["vertex_properties"][local_index, 0] = cube_physics_properties(
+                        episode,
+                        friction_field=str(args.friction_field),
+                    )
+                    out["vertex_properties"][local_index, 1] = gripper_property_vector(args)
 
                 object_points = np.empty((steps, len(OBJECT_NAMES), int(args.points), 3), dtype=np.float32)
                 for frame in range(steps):
