@@ -97,6 +97,15 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument("--gzip-level", type=int, choices=range(1, 10), default=4)
     parser.add_argument("--episode-start", type=int, default=0)
     parser.add_argument("--num-episodes", type=int, default=0, help="0 means all episodes from episode-start.")
+    parser.add_argument(
+        "--step-policy",
+        choices=("strict", "min"),
+        default="strict",
+        help=(
+            "How to handle variable-length source episodes. 'strict' requires equal lengths; "
+            "'min' trims every selected episode to the shortest selected length."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -476,6 +485,7 @@ def create_or_open_output(
     args: argparse.Namespace,
     *,
     episode_names: list[str],
+    source_episode_steps: np.ndarray,
     steps: int,
     hand_mesh_path: Path,
     finger_mesh_path: Path,
@@ -535,6 +545,7 @@ def create_or_open_output(
     data.create_dataset("done", data=np.zeros((len(episode_names),), dtype=bool), chunks=(min(len(episode_names), 1024),))
     data.create_dataset("object_names", data=np.asarray(OBJECT_NAMES, dtype=object), dtype=h5py.string_dtype("utf-8"))
     data.create_dataset("episode_names", data=np.asarray(episode_names, dtype=object), dtype=h5py.string_dtype("utf-8"))
+    data.create_dataset("source_episode_steps", data=np.asarray(source_episode_steps, dtype=np.int32))
     if bool(args.physics_properties):
         data.create_dataset(
             "vertex_properties",
@@ -581,6 +592,10 @@ def create_or_open_output(
             "franka_mesh_dir": str(mesh_dir) if mesh_dir is not None else None,
             "hand_mesh": str(hand_mesh_path),
             "finger_mesh": str(finger_mesh_path),
+            "step_policy": str(args.step_policy),
+            "steps": int(steps),
+            "source_episode_steps_min": int(np.min(source_episode_steps)),
+            "source_episode_steps_max": int(np.max(source_episode_steps)),
             "control_dt": control_dt,
             "source_attrs": source_attrs,
         },
@@ -614,14 +629,27 @@ def main() -> str:
         episode_names = all_episode_names[start:stop]
         if not episode_names:
             raise ValueError("No episodes selected.")
-        steps = get_episode_steps(data[episode_names[0]])
-        for name in episode_names:
-            if get_episode_steps(data[name]) != steps:
-                raise RuntimeError("All selected episodes must have the same number of samples.")
+        source_episode_steps = np.asarray([get_episode_steps(data[name]) for name in episode_names], dtype=np.int32)
+        if str(args.step_policy) == "strict":
+            steps = int(source_episode_steps[0])
+            if not np.all(source_episode_steps == steps):
+                raise RuntimeError(
+                    "All selected episodes must have the same number of samples. "
+                    f"Got min={int(source_episode_steps.min())}, max={int(source_episode_steps.max())}; "
+                    "rerun with --step-policy min to trim every episode to the shortest selected length."
+                )
+        else:
+            steps = int(source_episode_steps.min())
+            print(
+                "[INFO] Variable source episode lengths detected; "
+                f"using --step-policy min and trimming all selected episodes to {steps} steps "
+                f"(source min={int(source_episode_steps.min())}, max={int(source_episode_steps.max())})."
+            )
 
     output = create_or_open_output(
         args,
         episode_names=episode_names,
+        source_episode_steps=source_episode_steps,
         steps=steps,
         hand_mesh_path=hand_mesh_path,
         finger_mesh_path=finger_mesh_path,

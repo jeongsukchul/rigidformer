@@ -50,6 +50,8 @@ def _point_indices(
     seed: int,
     episode_index: int,
 ) -> np.ndarray:
+    if max_points <= 0:
+        max_points = stored_points
     if max_points > stored_points:
         raise ValueError(f"max_points={max_points} exceeds stored points={stored_points}")
     if max_points == stored_points:

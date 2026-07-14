@@ -466,9 +466,9 @@ def main() -> None:
     parser.add_argument("--render-num-episodes", type=int, default=4, help="Number of consecutive episodes to render.")
     parser.add_argument("--render-episode-index", type=int, default=None, help="Absolute episode index. Overrides --render-sample-index.")
     parser.add_argument("--render-start-frame", type=int, default=0)
-    parser.add_argument("--render-steps", type=int, default=48)
+    parser.add_argument("--render-steps", type=int, default=62)
     parser.add_argument("--render-stride", type=int, default=1)
-    parser.add_argument("--render-max-points", type=int, default=256, help="Points per object for render rollouts. Set 0 to use --max-points.")
+    parser.add_argument("--render-max-points", type=int, default=1024, help="Points per object for render rollouts. Set 0 to use --max-points.")
     parser.add_argument("--render-random-points", action="store_true")
     parser.add_argument("--render-video-fps", type=int, default=12)
     parser.add_argument(
@@ -478,7 +478,7 @@ def main() -> None:
         help="Use ground-truth future positions for unsupervised/context objects such as the gripper.",
     )
     parser.add_argument("--disable-render-tqdm", action="store_true")
-    parser.add_argument("--max-points", type=int, default=512)
+    parser.add_argument("--max-points", type=int, default=1024)
     parser.add_argument("--min-stride", type=int, default=1)
     parser.add_argument("--max-stride", type=int, default=4)
     parser.add_argument(
@@ -499,7 +499,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--paper-architecture", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--paper-architecture", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vertex-feature-dim", type=int, default=256)
     parser.add_argument("--avp-dim", type=int, default=128)
     parser.add_argument("--paper-pointnet-level-dim", type=int, default=256)
@@ -516,7 +516,7 @@ def main() -> None:
         help="Comma-separated layer indices. Defaults to an even spread.",
     )
     parser.add_argument("--anchor-self-attn", action="store_true")
-    parser.add_argument("--use-platonic-transformer", action="store_true")
+    parser.add_argument("--use-platonic-transformer", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", type=Path, default=None)
     args = parser.parse_args()
 
